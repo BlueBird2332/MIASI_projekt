@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /home/mikele/MIASI/pylintool -name \"*Zone.Identifier*\" -delete)",
+      "Bash(.venv/bin/pip list:*)",
+      "Bash(mkdir -p /home/mikele/.m2/repository/org/antlr/antlr4/4.11.1)",
+      "Bash(curl -L -o /home/mikele/.m2/repository/org/antlr/antlr4/4.11.1/antlr4-4.11.1-complete.jar \"https://www.antlr.org/download/antlr-4.11.1-complete.jar\")"
+    ]
+  }
+}

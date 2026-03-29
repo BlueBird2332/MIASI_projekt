@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# ANTLR generated (regenerated via `make generate`)
+src/pylintool/generated/*.py
+src/pylintool/generated/*.interp
+src/pylintool/generated/*.tokens
+!src/pylintool/generated/__init__.py
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# uv
+uv.lock
