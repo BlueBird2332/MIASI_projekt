@@ -55,6 +55,10 @@ def check_heuristics(
     _check_line_length(issues, filepath, lines, cfg)
     _check_file_length(issues, filepath, lines, cfg)
     _check_functions_and_classes(issues, filepath, lines, cfg)
+    _check_todo_comments(issues, filepath, lines)
+    _check_print_statements(issues, filepath, lines)
+    _check_bare_except(issues, filepath, lines)
+    _check_magic_numbers(issues, filepath, lines)
 
     return issues
 
@@ -246,3 +250,106 @@ def _find_block_end(lines: list[str], body_start: int, parent_indent: str) -> in
             break
         i += 1
     return i
+
+
+_TODO_RE = re.compile(r"#.*\b(TODO|FIXME)\b", re.IGNORECASE)
+
+
+def _check_todo_comments(
+    issues: list[Issue],
+    fp: Path,
+    lines: list[str],
+) -> None:
+    """Report lines containing TODO or FIXME comments."""
+    for i, line in enumerate(lines, start=1):
+        m = _TODO_RE.search(line)
+        if m:
+            issues.append(Issue(
+                code=IssueCode.H007_TODO_COMMENT,
+                severity=Severity.INFO,
+                filepath=fp,
+                line=i,
+                col=line.index("#"),
+                message=f"Found '{m.group(1).upper()}' comment — consider resolving or tracking in an issue",
+            ))
+
+_PRINT_RE = re.compile(r"^\s*print\s*\(")
+
+
+def _check_print_statements(
+    issues: list[Issue],
+    fp: Path,
+    lines: list[str],
+) -> None:
+    """Report lines containing print() calls outside of comments."""
+    for i, line in enumerate(lines, start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if _PRINT_RE.match(line):
+            issues.append(Issue(
+                code=IssueCode.H008_PRINT_STATEMENT,
+                severity=Severity.WARNING,
+                filepath=fp,
+                line=i,
+                col=len(line) - len(stripped),
+                message="Found 'print()' call — use logging instead",
+            ))
+
+_BARE_EXCEPT_RE = re.compile(r"^\s*except\s*:")
+
+
+def _check_bare_except(
+    issues: list[Issue],
+    fp: Path,
+    lines: list[str],
+) -> None:
+    """Report bare except: clauses that catch all exceptions silently."""
+    for i, line in enumerate(lines, start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if _BARE_EXCEPT_RE.match(line):
+            issues.append(Issue(
+                code=IssueCode.H009_BARE_EXCEPT,
+                severity=Severity.WARNING,
+                filepath=fp,
+                line=i,
+                col=len(line) - len(stripped),
+                message="Found bare 'except:' — specify exception type, e.g. 'except Exception:'",
+            ))
+
+_MAGIC_NUMBER_RE = re.compile(r"(?<![=\w])\b(\d+\.?\d*)\b(?!\s*[=])")
+_MAGIC_NUMBER_ALLOWED = {"0", "1", "2", "-1"}
+
+
+def _check_magic_numbers(
+    issues: list[Issue],
+    fp: Path,
+    lines: list[str],
+) -> None:
+    """Report numeric literals used directly in expressions (magic numbers)."""
+    for i, line in enumerate(lines, start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        # Pomiń linie z przypisaniem stałej (UPPER_CASE = liczba)
+        if re.match(r"^\s*[A-Z_][A-Z0-9_]*\s*=", line):
+            continue
+        for m in _MAGIC_NUMBER_RE.finditer(line):
+            value = m.group(1)
+            if value in _MAGIC_NUMBER_ALLOWED:
+                continue
+            # Pomiń liczby wewnątrz stringów
+            col = m.start()
+            before = line[:col]
+            if before.count('"') % 2 == 1 or before.count("'") % 2 == 1:
+                continue
+            issues.append(Issue(
+                code=IssueCode.H010_MAGIC_NUMBER,
+                severity=Severity.INFO,
+                filepath=fp,
+                line=i,
+                col=col,
+                message=f"Magic number '{value}' — assign to a named constant instead",
+            ))
