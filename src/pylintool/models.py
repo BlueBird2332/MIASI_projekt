@@ -22,6 +22,7 @@ class IssueCode(Enum):
     W005_TAB_INLINE = "W005"
     W006_WRONG_INDENT_SIZE = "W006"
     W007_NO_NEWLINE_AT_EOF = "W007"
+    W008_OVER_INDENTED = "W008"
 
     # ── Type checking (T) ─────────────────────────────────────────
     T001_MYPY_ERROR = "T001"

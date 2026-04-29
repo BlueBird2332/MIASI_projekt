@@ -1,11 +1,13 @@
 """Whitespace checker — ANTLR-based analysis and auto-fix.
 
 Uses the PyWhitespaceParser parse tree to detect:
-- Tab indentation / mixed indentation
-- Trailing whitespace
-- Excess consecutive blank lines (>2)
-- Non-standard indent width
-- Missing final newline
+- Tab indentation / mixed indentation            (W001, W002)
+- Trailing whitespace                            (W003)
+- Excess consecutive blank lines (>2)            (W004)
+- Inline tab characters used for alignment       (W005)
+- Non-standard indent width                      (W006)
+- Missing final newline                          (W007)
+- Unexpected / redundant indentation             (W008)
 
 Also provides a ``fix_source`` function that rewrites the source.
 """
@@ -14,15 +16,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from antlr4 import CommonTokenStream, InputStream, ParseTreeWalker
+from antlr4 import CommonTokenStream, InputStream, ParseTreeWalker, Token
 
 from pylintool.generated.PyWhitespaceLexer import PyWhitespaceLexer
 from pylintool.generated.PyWhitespaceParser import PyWhitespaceParser
 from pylintool.generated.PyWhitespaceParserListener import PyWhitespaceParserListener
-from pylintool.models import FileResult, Issue, IssueCode, Severity
+from pylintool.models import Issue, IssueCode, Severity
 
 
-# ── Listener ──────────────────────────────────────────────────────
+# ── Parse-tree listener ───────────────────────────────────────────
 
 
 class _WhitespaceListener(PyWhitespaceParserListener):
@@ -118,11 +120,149 @@ class _WhitespaceListener(PyWhitespaceParserListener):
         ))
 
 
+# ── Token-stream analyses ─────────────────────────────────────────
+
+
+def _check_inline_tabs(filepath: Path, tokens: CommonTokenStream) -> list[Issue]:
+    """Detect tab characters used for inline alignment within a line (W005).
+
+    Leading and trailing whitespace is already handled by W001/W002/W003;
+    this function only flags tabs that appear *between* other tokens.
+    """
+    issues: list[Issue] = []
+    all_toks = tokens.tokens
+
+    for i, tok in enumerate(all_toks):
+        if tok.type != PyWhitespaceLexer.WS or "\t" not in tok.text:
+            continue
+        if tok.column == 0:
+            # Column-zero WS is leading indentation — already covered by W001/W002.
+            continue
+
+        # Determine whether this is trailing whitespace (only WS before NEWLINE/EOF).
+        is_trailing = False
+        for j in range(i + 1, len(all_toks)):
+            next_tok = all_toks[j]
+            if next_tok.line != tok.line:
+                is_trailing = True
+                break
+            if next_tok.type in (PyWhitespaceLexer.NEWLINE, Token.EOF):
+                is_trailing = True
+                break
+            if next_tok.type != PyWhitespaceLexer.WS:
+                # A non-WS token follows on the same line → inline tab.
+                break
+
+        if not is_trailing:
+            issues.append(Issue(
+                code=IssueCode.W005_TAB_INLINE,
+                severity=Severity.WARNING,
+                filepath=filepath,
+                line=tok.line,
+                col=tok.column,
+                message="Tab character used for alignment (use spaces)",
+            ))
+
+    return issues
+
+
+def _check_indent_structure(filepath: Path, tokens: CommonTokenStream) -> list[Issue]:
+    """Detect unexpected / redundant indentation (W008).
+
+    Walks the token stream line by line and maintains an indentation stack.
+    A line whose indentation exceeds the current stack top without a preceding
+    block-opening statement (one whose last visible token is ``:``) is flagged.
+
+    Continuation contexts (explicit ``\\`` or open brackets) are skipped.
+    """
+    _COLON = PyWhitespaceParser.COLON
+    _LPAREN = PyWhitespaceParser.LPAREN
+    _RPAREN = PyWhitespaceParser.RPAREN
+    _LBRACK = PyWhitespaceParser.LBRACK
+    _RBRACK = PyWhitespaceParser.RBRACK
+    _LBRACE = PyWhitespaceParser.LBRACE
+    _RBRACE = PyWhitespaceParser.RBRACE
+    _WS = PyWhitespaceLexer.WS
+    _NL = PyWhitespaceLexer.NEWLINE
+    _CMT = PyWhitespaceLexer.COMMENT
+    _LC = PyWhitespaceLexer.LINE_CONTINUATION
+
+    # Group all tokens by 1-based line number.
+    by_line: dict[int, list] = {}
+    for tok in tokens.tokens:
+        if tok.type == Token.EOF:
+            continue
+        by_line.setdefault(tok.line, []).append(tok)
+
+    indent_stack: list[int] = [0]
+    expecting_indent = False  # True after a line that ends with ':'
+    in_continuation = False   # True when inside explicit or implicit continuation
+    paren_depth = 0           # Net count of unclosed (, [, {
+    issues: list[Issue] = []
+
+    for lineno in sorted(by_line):
+        toks = by_line[lineno]
+
+        # Lines containing only whitespace / newlines are treated as blank.
+        if not any(t.type not in (_WS, _NL) for t in toks):
+            # Preserve current expecting_indent / paren_depth across blank lines.
+            continue
+
+        # Leading indentation (tabs expanded to 4 spaces).
+        indent = len(toks[0].text.expandtabs(4)) if toks[0].type == _WS else 0
+
+        # Only check indentation changes outside of continuation contexts.
+        if not in_continuation and paren_depth == 0:
+            top = indent_stack[-1]
+            if indent > top:
+                if not expecting_indent:
+                    issues.append(Issue(
+                        code=IssueCode.W008_OVER_INDENTED,
+                        severity=Severity.WARNING,
+                        filepath=filepath,
+                        line=lineno,
+                        col=0,
+                        message=(
+                            f"Unexpected indentation ({indent} spaces): "
+                            "not preceded by a block-opening statement"
+                        ),
+                    ))
+                indent_stack.append(indent)
+            elif indent < top:
+                # Dedent: pop stack levels until we match (or pass) the new level.
+                while len(indent_stack) > 1 and indent_stack[-1] > indent:
+                    indent_stack.pop()
+
+        # ── Update state for the NEXT line ────────────────────────
+        expecting_indent = False
+        in_continuation = False
+
+        # Block opener: last visible (non-WS, non-NL, non-comment) token is ':'.
+        visible = [t for t in toks if t.type not in (_WS, _NL, _CMT)]
+        if visible:
+            expecting_indent = (visible[-1].type == _COLON)
+
+        # Track explicit line-continuation and bracket depth.
+        for tok in toks:
+            if tok.type == _LC:
+                in_continuation = True
+            elif tok.type in (_LPAREN, _LBRACK, _LBRACE):
+                paren_depth += 1
+            elif tok.type in (_RPAREN, _RBRACK, _RBRACE):
+                paren_depth = max(0, paren_depth - 1)
+
+        # Implicit continuation while inside open brackets.
+        if paren_depth > 0:
+            in_continuation = True
+
+    return issues
+
+
 # ── Public API ────────────────────────────────────────────────────
 
 
 def check_whitespace(filepath: Path, source: str) -> list[Issue]:
-    """Parse *source* with ANTLR and return whitespace issues."""
+    """Parse *source* with ANTLR and return all whitespace/indentation issues."""
     input_stream = InputStream(source)
     lexer = PyWhitespaceLexer(input_stream)
     tokens = CommonTokenStream(lexer)
@@ -133,16 +273,20 @@ def check_whitespace(filepath: Path, source: str) -> list[Issue]:
     listener = _WhitespaceListener(filepath)
     ParseTreeWalker().walk(listener, tree)
 
-    # Token-stream trailing whitespace check.
-    # The grammar may greedily consume trailing spaces into line_content,
-    # so we scan the raw token stream for WS immediately before NEWLINE/EOF.
+    issues: list[Issue] = list(listener.issues)
+
+    # Fill the token stream so the post-parse scans see every token.
     tokens.fill()
     all_tokens = tokens.tokens
+
+    # ── W003: trailing whitespace (token-stream fallback) ─────────
+    # The grammar may consume trailing spaces into line_content;
+    # scan the raw token stream to catch what the listener missed.
     for i, tok in enumerate(all_tokens):
         if tok.type == PyWhitespaceLexer.WS:
             next_type = all_tokens[i + 1].type if i + 1 < len(all_tokens) else -1
             if next_type in (PyWhitespaceLexer.NEWLINE, PyWhitespaceParser.EOF):
-                listener.issues.append(Issue(
+                issues.append(Issue(
                     code=IssueCode.W003_TRAILING_WHITESPACE,
                     severity=Severity.WARNING,
                     filepath=filepath,
@@ -151,9 +295,15 @@ def check_whitespace(filepath: Path, source: str) -> list[Issue]:
                     message="Trailing whitespace",
                 ))
 
-    # Check final newline (cannot be detected from the parse tree alone).
+    # ── W005: inline tab characters ───────────────────────────────
+    issues.extend(_check_inline_tabs(filepath, tokens))
+
+    # ── W008: unexpected / redundant indentation ──────────────────
+    issues.extend(_check_indent_structure(filepath, tokens))
+
+    # ── W007: missing final newline ───────────────────────────────
     if source and not source.endswith("\n"):
-        listener.issues.append(Issue(
+        issues.append(Issue(
             code=IssueCode.W007_NO_NEWLINE_AT_EOF,
             severity=Severity.WARNING,
             filepath=filepath,
@@ -162,7 +312,7 @@ def check_whitespace(filepath: Path, source: str) -> list[Issue]:
             message="No newline at end of file",
         ))
 
-    return listener.issues
+    return issues
 
 
 def fix_source(source: str) -> str:
@@ -170,10 +320,15 @@ def fix_source(source: str) -> str:
 
     Fixes applied
     -------------
-    1. Tabs → 4 spaces
-    2. Trailing whitespace removed
-    3. Consecutive blank lines capped at 2
-    4. Exactly one newline at EOF
+    1. Tabs → 4 spaces everywhere (fixes W001, W002, W005)
+    2. Trailing whitespace stripped (fixes W003)
+    3. Consecutive blank lines capped at 2 (fixes W004)
+    4. Exactly one newline at end of file (fixes W007)
+
+    Not fixed automatically
+    -----------------------
+    W006 (wrong indent multiple) and W008 (over-indentation) require
+    understanding block context and are left for the developer to resolve.
     """
     lines = source.split("\n")
     fixed: list[str] = []

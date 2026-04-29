@@ -124,3 +124,68 @@ class TestCheckWhitespace:
         issues = check_whitespace(Path("test.py"), source)
         codes = {i.code.value for i in issues}
         assert "W007" in codes
+
+    def test_inline_tab_detected(self):
+        from pylintool.checkers.whitespace import check_whitespace
+        from pathlib import Path
+
+        source = "x\t= 1\n"
+        issues = check_whitespace(Path("test.py"), source)
+        codes = {i.code.value for i in issues}
+        assert "W005" in codes
+
+    def test_leading_tab_not_flagged_as_inline(self):
+        """Tab used for indentation should be W001, not W005."""
+        from pylintool.checkers.whitespace import check_whitespace
+        from pathlib import Path
+
+        source = "\tx = 1\n"
+        issues = check_whitespace(Path("test.py"), source)
+        codes = {i.code.value for i in issues}
+        assert "W001" in codes
+        assert "W005" not in codes
+
+    def test_over_indented_without_block_opener(self):
+        from pylintool.checkers.whitespace import check_whitespace
+        from pathlib import Path
+
+        source = "x = 1\n    y = 2\n"
+        issues = check_whitespace(Path("test.py"), source)
+        codes = {i.code.value for i in issues}
+        assert "W008" in codes
+
+    def test_correct_indentation_after_block_opener(self):
+        from pylintool.checkers.whitespace import check_whitespace
+        from pathlib import Path
+
+        source = "def foo():\n    return 1\n"
+        issues = check_whitespace(Path("test.py"), source)
+        codes = {i.code.value for i in issues}
+        assert "W008" not in codes
+
+    def test_top_level_indentation_flagged(self):
+        from pylintool.checkers.whitespace import check_whitespace
+        from pathlib import Path
+
+        source = "    x = 1\n"
+        issues = check_whitespace(Path("test.py"), source)
+        codes = {i.code.value for i in issues}
+        assert "W008" in codes
+
+    def test_continuation_not_flagged_as_over_indented(self):
+        from pylintool.checkers.whitespace import check_whitespace
+        from pathlib import Path
+
+        source = "x = (\n    1 + 2\n)\n"
+        issues = check_whitespace(Path("test.py"), source)
+        codes = {i.code.value for i in issues}
+        assert "W008" not in codes
+
+    def test_nested_block_not_flagged(self):
+        from pylintool.checkers.whitespace import check_whitespace
+        from pathlib import Path
+
+        source = "if True:\n    if True:\n        x = 1\n"
+        issues = check_whitespace(Path("test.py"), source)
+        codes = {i.code.value for i in issues}
+        assert "W008" not in codes
