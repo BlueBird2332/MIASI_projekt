@@ -315,19 +315,190 @@ def check_whitespace(filepath: Path, source: str) -> list[Issue]:
     return issues
 
 
-def fix_source(source: str) -> str:
-    """Return a cleaned-up copy of *source*.
+def _fix_blank_lines_structural(source: str) -> str:
+    """Structural blank-line pass using the ANTLR token stream.
 
-    Fixes applied
-    -------------
-    1. Tabs → 4 spaces everywhere (fixes W001, W002, W005)
+    Rules
+    -----
+    - 2 blank lines before top-level ``def`` / ``class`` / decorator.
+    - 1 blank line before any compound statement (``if``, ``for``, ``while``,
+      ``with``, ``try``, ``async``, ``match``) that is not the first statement
+      inside a block (i.e. not directly after a line ending with ``:``) and not
+      at the very start of the file.
+    - 0 blank lines before continuation keywords
+      (``elif``, ``else``, ``except``, ``finally``, ``case``).
+    - 0 blank lines between consecutive declaration lines
+      (``NAME … = …`` assignments).
+    - Original blank count (capped at 2) preserved everywhere else.
+    """
+    _L = PyWhitespaceLexer  # shorthand
+
+    BLOCK_STARTERS = {
+        _L.DEF, _L.CLASS, _L.FOR, _L.WHILE, _L.IF,
+        _L.WITH, _L.TRY, _L.ASYNC, _L.MATCH,
+    }
+    CONTINUATIONS = {_L.ELIF, _L.ELSE, _L.EXCEPT, _L.FINALLY, _L.CASE}
+
+    input_stream = InputStream(source)
+    lexer = PyWhitespaceLexer(input_stream)
+    stream = CommonTokenStream(lexer)
+    stream.fill()
+
+    # Bucket every token by its 1-based line number (includes HIDDEN channel).
+    by_line: dict[int, list] = {}
+    for tok in stream.tokens:
+        if tok.type == Token.EOF:
+            continue
+        by_line.setdefault(tok.line, []).append(tok)
+
+    source_lines = source.split("\n")
+    if source_lines and source_lines[-1] == "":
+        source_lines = source_lines[:-1]
+    total = len(source_lines)
+
+    # ── per-line helpers ──────────────────────────────────────────
+
+    def code_tokens(ln: int) -> list:
+        """Visible non-whitespace, non-newline, non-comment tokens."""
+        return [t for t in by_line.get(ln, [])
+                if t.type not in (_L.WS, _L.NEWLINE, _L.COMMENT)]
+
+    def has_content(ln: int) -> bool:
+        """True if the line has any non-whitespace token (including comments)."""
+        return any(t.type not in (_L.WS, _L.NEWLINE) for t in by_line.get(ln, []))
+
+    def indent_of(ln: int) -> int:
+        toks = by_line.get(ln, [])
+        if toks and toks[0].type == _L.WS:
+            return len(toks[0].text.expandtabs(4))
+        return 0
+
+    def ends_with_colon(ln: int) -> bool:
+        ct = code_tokens(ln)
+        return bool(ct and ct[-1].type == _L.COLON)
+
+    def is_declaration(ln: int) -> bool:
+        ct = code_tokens(ln)
+        if not ct or ct[0].type != _L.NAME:
+            return False
+        if ct[-1].type == _L.COLON:
+            return False
+        return any(t.type == _L.ASSIGN for t in ct)
+
+    # ── classify every source line (1-based) ─────────────────────
+    # Kinds: blank | compound_top | compound_inner | continuation
+    #        | decorator | declaration | other
+
+    kinds: dict[int, str] = {}
+    for i in range(total):
+        ln = i + 1
+        if not has_content(ln):
+            kinds[ln] = "blank"
+            continue
+        ct = code_tokens(ln)
+        ft = ct[0].type if ct else None   # first code token (None → comment-only)
+        if ft is None:
+            kinds[ln] = "other"           # comment-only line
+        elif ft in CONTINUATIONS:
+            kinds[ln] = "continuation"
+        elif ft == _L.AT:
+            kinds[ln] = "decorator"
+        elif ft in BLOCK_STARTERS:
+            kinds[ln] = "compound_top" if indent_of(ln) == 0 else "compound_inner"
+        elif is_declaration(ln):
+            kinds[ln] = "declaration"
+        else:
+            kinds[ln] = "other"
+
+    def prev_nonblank(ln: int) -> int | None:
+        for j in range(ln - 1, 0, -1):
+            if kinds[j] != "blank":
+                return j
+        return None
+
+    def original_blanks_before(ln: int) -> int:
+        count = 0
+        for j in range(ln - 1, 0, -1):
+            if kinds[j] == "blank":
+                count += 1
+            else:
+                break
+        return count
+
+    # ── build output segments: (blanks_before, line_text) ────────
+    segments: list[tuple[int, str]] = []
+
+    for i in range(total):
+        ln = i + 1
+        kind = kinds[ln]
+        if kind == "blank":
+            continue  # recomputed from scratch
+
+        pn = prev_nonblank(ln)
+        pk = kinds.get(pn) if pn else None
+        prev_colon = ends_with_colon(pn) if pn else False
+
+        if kind in ("compound_top", "compound_inner"):
+            if pn is None or pk == "decorator" or prev_colon:
+                blanks = 0
+            else:
+                blanks = 2 if kind == "compound_top" else 1
+
+        elif kind == "decorator":
+            if pn is None or pk == "decorator" or prev_colon:
+                blanks = 0
+            else:
+                blanks = 2 if indent_of(ln) == 0 else 1
+
+        elif kind == "continuation":
+            blanks = 0
+
+        elif kind == "declaration":
+            blanks = 0 if pk == "declaration" else min(original_blanks_before(ln), 2)
+
+        else:  # "other"
+            blanks = min(original_blanks_before(ln), 2)
+
+        # After any block body ends (dedent), ensure at least 1 blank line
+        # unless the line is a continuation keyword (elif/else/except/finally).
+        if kind != "continuation" and pn and indent_of(pn) > indent_of(ln):
+            blanks = max(blanks, 1)
+
+        segments.append((blanks, source_lines[i]))
+
+    if not segments:
+        return ""
+
+    result: list[str] = []
+    for idx, (blanks, text) in enumerate(segments):
+        if idx > 0:
+            result.extend("" for _ in range(blanks))
+        result.append(text)
+
+    return "\n".join(result) + "\n"
+
+
+def fix_source(source: str) -> str:
+    """Return a fully formatted copy of *source*.
+
+    Phase 1 — text-level fixes
+    --------------------------
+    1. Tabs → 4 spaces (fixes W001, W002, W005)
     2. Trailing whitespace stripped (fixes W003)
     3. Consecutive blank lines capped at 2 (fixes W004)
     4. Exactly one newline at end of file (fixes W007)
 
+    Phase 2 — structural blank-line formatting
+    ------------------------------------------
+    5. 2 blank lines before top-level ``def`` / ``class`` / decorator.
+    6. 1 blank line before compound statements (``if``, ``for``, ``while``,
+       ``with``, ``try``, ``async``, ``match``) inside blocks.
+    7. 0 blank lines before ``elif`` / ``else`` / ``except`` / ``finally``.
+    8. 0 blank lines between consecutive declaration lines.
+
     Not fixed automatically
     -----------------------
-    W006 (wrong indent multiple) and W008 (over-indentation) require
+    W006 (wrong indent width) and W008 (over-indentation) require
     understanding block context and are left for the developer to resolve.
     """
     lines = source.split("\n")
@@ -336,7 +507,6 @@ def fix_source(source: str) -> str:
 
     for raw in lines:
         line = raw.expandtabs(4).rstrip()
-
         if line == "":
             consecutive_blank += 1
             if consecutive_blank <= 2:
@@ -345,9 +515,11 @@ def fix_source(source: str) -> str:
             consecutive_blank = 0
             fixed.append(line)
 
-    # Trim trailing blank lines, then ensure exactly one final newline.
     while fixed and fixed[-1] == "":
         fixed.pop()
 
-    text = "\n".join(fixed)
-    return text + "\n" if text else ""
+    if not fixed:
+        return ""
+
+    cleaned = "\n".join(fixed) + "\n"
+    return _fix_blank_lines_structural(cleaned)

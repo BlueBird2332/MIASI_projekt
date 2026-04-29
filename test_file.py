@@ -1,15 +1,18 @@
 def some_python_function():
-    
+
 
     print("This is a test function.")
 
+
 def another_function():
+
+    a = 1
+    c = 3
     return 42
 
 #TODO: do a thing
 #FIXME: make it better
 msg = "TODO: abc"
-
 x=0;
 print("debug: value x =", x)
 # print("commented")
@@ -21,6 +24,7 @@ try:
 except:                         # detected H009
     pass
 
+
 try:
     y = int("abc")
 except ValueError:              # not detected (type provided)
@@ -29,14 +33,15 @@ except ValueError:              # not detected (type provided)
 # except:                       # not detected
 
 
-
 MAX_TIMEOUT = 30                # not detected - constant
-
 response_code = 0
+
+
 if response_code == 404:        # detected H010
     pass
 
 delay = 0.5 * 1000              # detected H010 (1000)
+
 
 if x == 0 or y == 1:            # not detected — 0 and 0 allowed
     pass
